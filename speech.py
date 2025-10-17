@@ -156,11 +156,54 @@ class ProductCodeTranscriber:
     def normalize_pcode_portion(self, text: str) -> str:
         """Normalize only the product code portion (letters + individual digits)."""
         text = text.lower().strip()
-        
+
         # Remove "and" and commas from constructions like "one hundred and eight"
         text = re.sub(r'\band\b', '', text)
         text = re.sub(r',', ' ', text)
-        
+
+        # Handle "one hundred eight" style patterns in product codes FIRST
+        # These should become "108" not "18"
+        # Match patterns like "X hundred Y" or "X hundred YZ"
+        for hundreds_digit in range(1, 10):
+            hundreds_word = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'][hundreds_digit - 1]
+
+            # Match "X hundred YZ" patterns and convert to full three digits
+            for tens_digit in range(0, 10):
+                tens_word = ['', 'ten', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'][tens_digit]
+
+                if tens_digit == 0:
+                    # Just ones digit (e.g., "one hundred eight" -> "108")
+                    for ones_digit in range(0, 10):
+                        ones_word = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'][ones_digit]
+                        pattern = rf'\b{hundreds_word}\s+hundred\s+{ones_word}\b'
+                        replacement = f'{hundreds_digit}0{ones_digit}'
+                        text = re.sub(pattern, replacement, text)
+                elif tens_digit == 1:
+                    # Teens (e.g., "one hundred eleven" -> "111")
+                    teens = ['ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen']
+                    for teen_idx, teen_word in enumerate(teens):
+                        pattern = rf'\b{hundreds_word}\s+hundred\s+{teen_word}\b'
+                        replacement = f'{hundreds_digit}1{teen_idx}'
+                        text = re.sub(pattern, replacement, text)
+                else:
+                    # Tens + ones (e.g., "one hundred twenty three" -> "123")
+                    for ones_digit in range(0, 10):
+                        ones_word = ['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'][ones_digit]
+                        if ones_word:
+                            pattern = rf'\b{hundreds_word}\s+hundred\s+{tens_word}\s+{ones_word}\b'
+                            replacement = f'{hundreds_digit}{tens_digit}{ones_digit}'
+                            text = re.sub(pattern, replacement, text)
+                        else:
+                            # Just tens (e.g., "one hundred twenty" -> "120")
+                            pattern = rf'\b{hundreds_word}\s+hundred\s+{tens_word}\b'
+                            replacement = f'{hundreds_digit}{tens_digit}0'
+                            text = re.sub(pattern, replacement, text)
+
+            # Handle "X hundred" alone -> "X00"
+            pattern = rf'\b{hundreds_word}\s+hundred\b'
+            replacement = f'{hundreds_digit}00'
+            text = re.sub(pattern, replacement, text)
+
         # CRITICAL: Remove ALL multiplier words that might appear in product codes
         # These should be ignored as they're typically misinterpretations
         multiplier_words = r'\b(hundred|thousand|lakh|lakhs|lac|lacs|crore|crores|million|millions|billion|billions|trillion|trillions)\b'
@@ -325,24 +368,41 @@ class ProductCodeTranscriber:
                 words = text_lower.split()
         
         # Check if transcript is missing the first letter - try all single letters
-        first_word_is_digit = words[0] in {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 
+        first_word_is_digit = words[0] in {'zero', 'oh', 'one', 'two', 'three', 'four', 'five',
                                             'six', 'seven', 'eight', 'nine', 'double', 'triple'} or \
                               words[0].startswith('doub') or words[0].startswith('trip') or \
                               words[0].isdigit()
-        
+
         if first_word_is_digit:
-            # Try prefixing with each letter a-z
+            # First, try to match pure numeric codes directly
+            for end_idx in range(1, min(len(words) + 1, 10)):
+                partial_text = ' '.join(words[:end_idx])
+                normalized_partial = self.normalize_pcode_portion(partial_text)
+                normalized_clean = normalized_partial.replace(' ', '')
+
+                # Check for pure numeric pattern
+                numeric_match = re.match(r'^(\d+)', normalized_clean)
+                if numeric_match:
+                    candidate = numeric_match.group(1)
+                    for pcode in self.pcode_list:
+                        pcode_clean = str(pcode).lower()
+                        if pcode_clean == candidate:
+                            # Found a pure numeric match! Return it
+                            remaining_text = ' '.join(words[end_idx:])
+                            return pcode_clean, remaining_text, 1.0
+
+            # If no pure numeric match, try prefixing with each letter a-z
             for letter in 'abcdefghijklmnopqrstuvwxyz':
                 test_text = letter + ' ' + text_lower
                 test_words = test_text.split()
-                
+
                 # Try to match with this letter prefix
                 for end_idx in range(1, min(len(test_words) + 1, 10)):
                     partial_text = ' '.join(test_words[:end_idx])
                     normalized_partial = self.normalize_pcode_portion(partial_text)
                     normalized_clean = normalized_partial.replace(' ', '')
                     match = re.match(r'^([a-z]+\d+)', normalized_clean)
-                    
+
                     if match:
                         candidate = match.group(1)
                         for pcode in self.pcode_list:
@@ -365,42 +425,35 @@ class ProductCodeTranscriber:
             # Extract letter-digit sequence
             normalized_clean = normalized_partial.replace(' ', '')
             
-            # DEBUG: Show what we're processing
-            print(f"  DEBUG: Processing words {words[:end_idx]} -> normalized: '{normalized_clean}'")
-            
             # Look for letter-digit patterns of various lengths
             # Try different patterns to capture the full product code
             patterns = [
                 r'^([a-z]+\d+)',  # Original pattern
                 r'^([a-z]+\d[\d]*)',  # More flexible digit matching
+                r'^(\d+)',  # Pure numeric pcodes
             ]
-            
+
             candidate = ""
             for pattern in patterns:
                 match = re.match(pattern, normalized_clean)
                 if match:
                     candidate = match.group(1)
                     break
-            
+
             if candidate:
-                # Debug: print what we're checking
-                print(f"  DEBUG: Checking candidate '{candidate}' from normalized: '{normalized_clean}'")
-                
                 # Check if this EXACT candidate is in our list
                 if candidate in [str(p).lower() for p in self.pcode_list]:
-                    print(f"  DEBUG: Found exact match '{candidate}'!")
                     best_match = candidate
                     best_match_end_index = end_idx
                     best_confidence = 1.0
                     # STOP HERE - don't look for longer matches
                     break
-                
+
                 # Also check if we have a partial match that could be extended
                 # This handles cases where the product code might be longer than what we've captured
                 for pcode in self.pcode_list:
                     pcode_clean = str(pcode).lower()
                     if pcode_clean.startswith(candidate):
-                        print(f"  DEBUG: Found partial match '{candidate}' -> '{pcode_clean}'")
                         # Continue to see if we can get the full match
                         continue
         
@@ -419,6 +472,7 @@ class ProductCodeTranscriber:
             patterns = [
                 r'^([a-z]+\d+)',
                 r'^([a-z]+\d[\d]*)',
+                r'^(\d+)',  # Pure numeric pcodes
             ]
             
             candidate = ""
@@ -576,7 +630,7 @@ class ProductCodeTranscriber:
 
 
 if __name__ == "__main__":
-    with open("keys/elevenlabs.key", "r") as f:
+    with open("keys/deepgram.key", "r") as f:
         api_key = f.read().strip()
     
     transcriber = ProductCodeTranscriber(api_key)

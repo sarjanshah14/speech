@@ -1,158 +1,641 @@
-import re
+import requests
 import json
-from word2number import w2n
-from deep_translator import GoogleTranslator
+import re
+from typing import Dict, List, Tuple
+from pathlib import Path
+import openpyxl
+from difflib import SequenceMatcher
 
-# --- ElevenLabs API Key (replace with yours) ---
-from elevenlabs import ElevenLabs
-
-# Read the ElevenLabs API key from file
-with open("keys/elevenlabs.key", "r") as f:
-    API_KEY = f.read().strip()
-
-# Initialize ElevenLabs client
-client = ElevenLabs(api_key=API_KEY)
-
-
-# --- Normalize Devanagari (Hindi/Gujarati) digits ---
-def normalize_indic_digits(text):
-    trans_table = str.maketrans("०१२३४५६७८९", "0123456789")
-    return text.translate(trans_table)
-
-# --- Step 1: Transcribe audio ---
-def transcribe_audio(file_path, language_code="guj"):
-    print(f"\n🎙️ Transcribing with language: {language_code} ...")
-    with open(file_path, "rb") as audio:
-        transcription = client.speech_to_text.convert(
-            file=audio,
-            model_id="scribe_v1",
-            language_code=language_code
-        )
-    text = getattr(transcription, "text", str(transcription)).strip()
-    print("✅ Transcription done.")
-    return text, language_code
-
-# --- Step 2: Translate to English ---
-def translate_to_english(text):
-    translator = GoogleTranslator(source="auto", target="en")
-    return translator.translate(text)
-
-# --- Step 3: Normalize numbers robustly ---
-def normalize_numbers(text):
-    text = normalize_indic_digits(text)
-    text = text.lower()
-    text = re.sub(r'[,\-–—()]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    # Fix multi-word number phrases like "forty five", "twenty eight"
-    def replace_multiword_numbers(t):
-        try:
-            num = w2n.word_to_num(t)
-            return str(num)
-        except Exception:
-            return t
-
-    # Handle multi-word numeric sequences
-    pattern = r'\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|' \
-              r'eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|' \
-              r'eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|' \
-              r'eighty|ninety|hundred|thousand|million|and)(?:\s+(?:zero|one|two|' \
-              r'three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|' \
-              r'fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|' \
-              r'thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|and))*\b'
-
-    text = re.sub(pattern, lambda m: replace_multiword_numbers(m.group()), text)
-
-    # Convert single-digit words (four one one three → 4113)
-    digit_words = {
-        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-        "six": "6", "seven": "7", "eight": "8", "nine": "9"
-    }
-
-    tokens = text.split()
-    out = []
-    i = 0
-    while i < len(tokens):
-        if tokens[i] in digit_words:
-            digits = []
-            while i < len(tokens) and tokens[i] in digit_words:
-                digits.append(digit_words[tokens[i]])
-                i += 1
-            out.append("".join(digits))
+class ProductCodeTranscriber:
+    def __init__(self, deepgram_api_key: str, pcode_list: List[str] = None, excel_file: str = "productlist.xlsx"):
+        """
+        Initialize the transcriber with Deepgram API key and product codes.
+        """
+        self.api_key = deepgram_api_key
+        self.base_url = "https://api.deepgram.com/v1/listen"
+        
+        if pcode_list is None:
+            self.pcode_list = self.load_pcodes_from_excel(excel_file)
         else:
-            out.append(tokens[i])
-            i += 1
-
-    normalized = " ".join(out)
-    normalized = re.sub(r'\s+', ' ', normalized).strip()
-    return normalized
-
-# --- Step 4: Extract multiple pcode (5-char) + qty ---
-def extract_multiple_pairs(normalized_text):
-    clean = re.sub(r'[^a-z0-9\s]', ' ', normalized_text.lower())
-    tokens = [t for t in clean.split() if t]
-    results = []
-
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if re.match(r'^[a-z]', tok):  # start of a product code
-            letter = tok[0].upper()
-            digits = ''.join(re.findall(r'\d+', tok))
-            j = i + 1
-            while j < len(tokens) and len(digits) < 4:
-                if re.match(r'^\d+$', tokens[j]):
-                    digits += tokens[j]
+            self.pcode_list = pcode_list
+        
+        print(f"Loaded {len(self.pcode_list)} product codes")
+        
+        self.headers = {
+            "Authorization": f"Token {deepgram_api_key}"
+        }
+    
+    def load_pcodes_from_excel(self, excel_file: str) -> List[str]:
+        """Load product codes from Excel file first column."""
+        try:
+            wb = openpyxl.load_workbook(excel_file)
+            ws = wb.active
+            
+            pcodes = []
+            for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
+                if row[0]:
+                    code = str(row[0]).strip()
+                    pcodes.append(code)
+            
+            wb.close()
+            return pcodes
+        except Exception as e:
+            print(f"Error loading Excel file: {e}")
+            return []
+    
+    def transcribe_audio(self, audio_file_path: str) -> Dict:
+        """Transcribe audio file using Deepgram API."""
+        params = {
+            "model": "nova-2",
+            "language": "en",
+            "punctuate": "true",
+            "paragraphs": "true"
+        }
+        
+        with open(audio_file_path, "rb") as audio_file:
+            response = requests.post(
+                self.base_url,
+                headers=self.headers,
+                params=params,
+                data=audio_file
+            )
+        
+        if response.status_code != 200:
+            raise Exception(f"Deepgram API error: {response.status_code} - {response.text}")
+        
+        return response.json()
+    
+    def words_to_number(self, text: str) -> int:
+        """Convert written number words to integer (for quantity parsing).
+        Supports: hundred, thousand, lakh/lac, crore, million, billion, trillion
+        Properly handles cases like "one thirty five" = 135 and "two sixty seven" = 267
+        """
+        text = text.lower().strip()
+        
+        # Remove common filler words
+        text = re.sub(r'\band\b', ' ', text)
+        
+        word_values = {
+            'zero': 0, 'oh': 0,
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9,
+            'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13,
+            'fourteen': 14, 'fifteen': 15, 'sixteen': 16, 'seventeen': 17,
+            'eighteen': 18, 'nineteen': 19,
+            'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
+            'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90
+        }
+        
+        # Multipliers in ascending order for proper handling
+        multipliers = {
+            'hundred': 100,
+            'thousand': 1000,
+            'lakh': 100000,
+            'lac': 100000,
+            'lakhs': 100000,
+            'lacs': 100000,
+            'crore': 10000000,
+            'crores': 10000000,
+            'million': 1000000,
+            'millions': 1000000,
+            'billion': 1000000000,
+            'billions': 1000000000,
+            'trillion': 1000000000000,
+            'trillions': 1000000000000
+        }
+        
+        words = text.split()
+        result = 0
+        current = 0
+        
+        i = 0
+        while i < len(words):
+            word = words[i].strip()
+            if not word:
+                i += 1
+                continue
+            
+            if word in word_values:
+                # Check if this is part of a larger number or standalone
+                next_word = words[i + 1] if i + 1 < len(words) else None
+                
+                # If next word is a tens/compound (thirty, forty, etc.), this forms a compound number
+                # "one thirty" means 130, "two sixty" means 260
+                if next_word in ['twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety']:
+                    # Multiply current digit by 100 and add the tens value
+                    current += word_values[word] * 100
+                    i += 1  # Move to tens word
+                    current += word_values[words[i]]
+                    # Check for ones digit after tens
+                    if i + 1 < len(words) and words[i + 1] in word_values and word_values[words[i + 1]] < 10:
+                        i += 1
+                        current += word_values[words[i]]
                 else:
-                    break
-                j += 1
+                    current += word_values[word]
+            elif word in multipliers:
+                multiplier_value = multipliers[word]
+                
+                # Handle 'hundred' - it multiplies the current value
+                if word == 'hundred':
+                    if current == 0:
+                        current = 1
+                    current *= multiplier_value
+                else:
+                    # For larger multipliers (thousand, lakh, crore, etc.)
+                    if current == 0:
+                        current = 1
+                    result += current * multiplier_value
+                    current = 0
+            
+            i += 1
+        
+        # Add any remaining current value
+        result += current
+        return result
+    
+    def normalize_pcode_portion(self, text: str) -> str:
+        """Normalize only the product code portion (letters + individual digits)."""
+        original_text = text.lower().strip()
+        text = original_text
 
-            if len(digits) >= 4:
-                pcode = (letter + digits[:4]).upper()
+        # Check if original text contains compound words
+        compound_words = {'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+                         'seventeen', 'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty',
+                         'sixty', 'seventy', 'eighty', 'ninety'}
+        has_compound = any(word in compound_words for word in original_text.split())
 
-                # find next numeric token as quantity
-                k = j
-                qty = None
-                while k < len(tokens):
-                    if re.match(r'^\d+$', tokens[k]):
-                        qty = tokens[k]
-                        break
-                    k += 1
+        # Map letter words to letters to avoid confusion
+        letter_map = {
+            'zed': 'z', 'zee': 'z',
+            'bee': 'b',
+            'see': 'c', 'sea': 'c',
+            'dee': 'd',
+            'pee': 'p',
+            'tee': 't',
+            'vee': 'v',
+            'doubleyou': 'w', 'double u': 'w',
+            'ex': 'x',
+            'why': 'y',
+            'jay': 'j',
+            'kay': 'k',
+            'ell': 'l',
+            'em': 'm',
+            'en': 'n',
+            'oh': 'o',
+            'queue': 'q',
+            'are': 'r',
+            'ess': 's',
+            'you': 'u'
+        }
 
-                if qty:
-                    results.append({"pcode": pcode, "qty": qty})
-                    i = k + 1
-                    continue
-        i += 1
+        for word, letter in letter_map.items():
+            text = re.sub(r'\b' + word + r'\b', letter, text)
 
-    return results
+        # Remove multipliers from product codes - they are not part of the code
+        multipliers = {'hundred', 'thousand', 'lakh', 'lac', 'lakhs', 'lacs', 'crore', 'crores',
+                      'million', 'millions', 'billion', 'billions', 'trillion', 'trillions'}
+        text = re.sub(r'\b(' + '|'.join(multipliers) + r')\b', ' ', text)
 
-# --- Step 5: Main Pipeline ---
-def main(audio_file, language_code="eng"):
-    try:
-        original, lang = transcribe_audio(audio_file, language_code)
-        print("\n🗣️ Original Transcription:\n", original)
+        # Remove "and" and commas from constructions like "one hundred and eight"
+        text = re.sub(r'\band\b', '', text)
+        text = re.sub(r',', ' ', text)
 
-        translated = translate_to_english(original)
-        print("\n🌍 Translated to English:\n", translated)
+        # Handle specific case for "one hundred and eight" -> "108"
+        text = re.sub(r'\bone hundred and eight\b', '108', text)
 
-        normalized = normalize_numbers(translated)
-        print("\n🧩 Normalized Numbers & Codes:\n", normalized)
+        # Handle special cases like "triple zero", "double five"
+        special_patterns = [
+            (r'\btriple\s+zero\b', '000'), (r'\btriple\s+one\b', '111'), (r'\btriple\s+two\b', '222'),
+            (r'\btriple\s+three\b', '333'), (r'\btriple\s+four\b', '444'), (r'\btriple\s+five\b', '555'),
+            (r'\btriple\s+six\b', '666'), (r'\btriple\s+seven\b', '777'), (r'\btriple\s+eight\b', '888'),
+            (r'\btriple\s+nine\b', '999'),
+            (r'\bdouble\s+zero\b', '00'), (r'\bdouble\s+one\b', '11'), (r'\bdouble\s+two\b', '22'),
+            (r'\bdouble\s+three\b', '33'), (r'\bdouble\s+four\b', '44'), (r'\bdouble\s+five\b', '55'),
+            (r'\bdouble\s+six\b', '66'), (r'\bdouble\s+seven\b', '77'), (r'\bdouble\s+eight\b', '88'),
+            (r'\bdouble\s+nine\b', '99'),
+        ]
 
-        structured = extract_multiple_pairs(normalized)
-        print("\n📦 Structured JSON Output:\n", json.dumps(structured, indent=2, ensure_ascii=False))
+        for pattern, replacement in special_patterns:
+            text = re.sub(pattern, replacement, text)
 
-        with open("translation_output.txt", "w", encoding="utf-8") as f:
-            f.write(f"Original Transcription:\n{original}\n\n")
-            f.write(f"Translated to English:\n{translated}\n\n")
-            f.write(f"Normalized Numbers & Codes:\n{normalized}\n\n")
-            f.write(f"Structured JSON Output:\n{json.dumps(structured, indent=2, ensure_ascii=False)}\n")
+        # DON'T convert compound numbers in product codes!
+        # Product codes are spelled digit-by-digit, not as compound numbers
+        # e.g., "L one two five seven" not "L one thousand two hundred fifty seven"
+        # Skip the hundred/thousand conversion entirely for product codes
 
-        print("\n✅ Done! Saved translation_output.txt")
+        # Handle misrecognized tens + ones as compound numbers in product codes
+        # e.g., "fifty seven" means "57" not "5 7"
+        word_values = {
+            'zero': 0, 'oh': 0,
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9,
+            'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13,
+            'fourteen': 14, 'fifteen': 15, 'sixteen': 16, 'seventeen': 17,
+            'eighteen': 18, 'nineteen': 19,
+            'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
+            'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90
+        }
 
-    except Exception as e:
-        print("\n❌ Error:", e)
+        tens_corrections = [
+            # Teens (compound words)
+            (r'\bten\b', '10'),
+            (r'\beleven\b', '11'),
+            (r'\btwelve\b', '12'),
+            (r'\bthirteen\b', '13'),
+            (r'\bfourteen\b', '14'),
+            (r'\bfifteen\b', '15'),
+            (r'\bsixteen\b', '16'),
+            (r'\bseventeen\b', '17'),
+            (r'\beighteen\b', '18'),
+            (r'\bnineteen\b', '19'),
+            # Tens + ones
+            (r'\btwenty\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '2' + str(word_values[m.group(1)])),
+            (r'\bthirty\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '3' + str(word_values[m.group(1)])),
+            (r'\bforty\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '4' + str(word_values[m.group(1)])),
+            (r'\bfifty\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '5' + str(word_values[m.group(1)])),
+            (r'\bsixty\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '6' + str(word_values[m.group(1)])),
+            (r'\bseventy\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '7' + str(word_values[m.group(1)])),
+            (r'\beighty\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '8' + str(word_values[m.group(1)])),
+            (r'\bninety\s+(one|two|three|four|five|six|seven|eight|nine)\b', lambda m: '9' + str(word_values[m.group(1)])),
+            # Handle bare tens words (without following digit)
+            (r'\btwenty\b', '20'),
+            (r'\bthirty\b', '30'),
+            (r'\bforty\b', '40'),
+            (r'\bfifty\b', '50'),
+            (r'\bsixty\b', '60'),
+            (r'\bseventy\b', '70'),
+            (r'\beighty\b', '80'),
+            (r'\bninety\b', '90'),
+        ]
 
-# --- Run ---
+        for pattern, replacement in tens_corrections:
+            text = re.sub(pattern, replacement, text)
+
+        # Only convert individual digit words (0-9)
+        simple_digit_map = {
+            'zero': '0', 'oh': '0',
+            'one': '1', 'two': '2', 'to': '2', 'too': '2',
+            'three': '3', 'four': '4', 'for': '4',
+            'five': '5', 'six': '6', 'seven': '7',
+            'eight': '8', 'ate': '8', 'nine': '9'
+        }
+
+        for word, digit in simple_digit_map.items():
+            text = re.sub(r'\b' + word + r'\b', digit, text)
+
+        # Clean up spaces: concatenate letters with digits
+        text = re.sub(r'([a-z])\s+(\d)', r'\1\2', text)
+        # Conditionally concatenate digits with digits only if no compound words in original
+        if not has_compound:
+            text = re.sub(r'\d(\s+\d)+', lambda m: m.group(0).replace(' ', ''), text)
+
+        text = text.strip()
+        return text
+    
+    def find_closest_pcode(self, candidate: str, threshold: float = 0.8) -> Tuple[str, float]:
+        """
+        Find the closest matching product code from the list.
+        Returns: (best_match, similarity_score)
+        """
+        if not candidate:
+            return "", 0.0
+        
+        candidate_lower = candidate.lower()
+        best_match = ""
+        best_score = 0.0
+        
+        for pcode in self.pcode_list:
+            pcode_clean = str(pcode).lower()
+            
+            # Exact match
+            if pcode_clean == candidate_lower:
+                return pcode_clean, 1.0
+            
+            # Calculate similarity
+            similarity = SequenceMatcher(None, candidate_lower, pcode_clean).ratio()
+            
+            # Also check if candidate is a substring or vice versa
+            if candidate_lower in pcode_clean or pcode_clean in candidate_lower:
+                # Boost score for substring matches
+                substring_score = max(len(candidate_lower), len(pcode_clean)) / max(len(candidate_lower), len(pcode_clean))
+                similarity = max(similarity, substring_score * 0.9)
+            
+            if similarity > best_score:
+                best_score = similarity
+                best_match = pcode_clean
+        
+        # Only return if above threshold
+        if best_score >= threshold:
+            return best_match, best_score
+        
+        return "", 0.0
+    
+    def extract_pcode_and_remaining_text(self, text: str) -> Tuple[str, str, float]:
+        """
+        Extract pcode and return the remaining text after the pcode.
+        Returns: (pcode, remaining_text, confidence_score)
+        """
+        text_lower = text.lower().strip()
+        # Remove punctuation that might interfere
+        text_lower = re.sub(r'[.,!?;:]', '', text_lower)
+        words = text_lower.split()
+        
+        if not words:
+            return "", "", 0.0
+        
+        # Check if first word is misrecognized "eight" -> "h"
+        first_word = words[0]
+        if first_word == 'eight' and len(words) > 1:
+            next_word = words[1]
+            digit_words = {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+                          'double', 'triple'}
+            if next_word in digit_words or next_word.startswith('doub') or next_word.startswith('trip'):
+                text_lower = 'h ' + ' '.join(words[1:])
+                words = text_lower.split()
+        
+        # Check if transcript is missing the first letter - try all single letters
+        first_word_is_digit = words[0] in {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 
+                                            'six', 'seven', 'eight', 'nine', 'double', 'triple'} or \
+                              words[0].startswith('doub') or words[0].startswith('trip') or \
+                              words[0].isdigit()
+        
+        if first_word_is_digit:
+            # Try prefixing with each letter a-z
+            for letter in 'abcdefghijklmnopqrstuvwxyz':
+                test_text = letter + ' ' + text_lower
+                test_words = test_text.split()
+                
+                # Try to match with this letter prefix
+                for end_idx in range(1, min(len(test_words) + 1, 10)):
+                    partial_text = ' '.join(test_words[:end_idx])
+                    normalized_partial = self.normalize_pcode_portion(partial_text)
+                    normalized_clean = normalized_partial.replace(' ', '')
+                    match = re.match(r'^([a-z]+\d+)', normalized_clean)
+                    
+                    if match:
+                        candidate = match.group(1)
+                        for pcode in self.pcode_list:
+                            pcode_clean = str(pcode).lower()
+                            if pcode_clean == candidate:
+                                # Found a match! Return it
+                                remaining_text = ' '.join(words[end_idx-1:])
+                                return pcode_clean, remaining_text, 1.0
+        
+        # Find where the pcode ends by matching against known pcodes
+        # Try progressively longer sequences first to prefer longer matches
+        best_match = ""
+        best_match_end_index = 0
+        best_confidence = 0.0
+
+        max_end = min(len(words), 15)
+        for end_idx in range(max_end, 0, -1):
+            partial_text = ' '.join(words[:end_idx])
+
+            # Try words_to_number for number words
+            try:
+                num = self.words_to_number(partial_text)
+                candidate = str(num)
+                if candidate in [str(p).lower() for p in self.pcode_list]:
+                    best_match = candidate
+                    best_match_end_index = end_idx
+                    best_confidence = 1.0
+                    break  # Stop on first (longest) match
+            except:
+                pass
+
+            # Special case: if starts with letter, try number on the rest
+            if partial_text and partial_text[0].isalpha() and len(words) > 1:
+                try:
+                    num = self.words_to_number(' '.join(words[1:end_idx]))
+                    candidate = partial_text[0].lower() + str(num)
+                    if candidate in [str(p).lower() for p in self.pcode_list]:
+                        best_match = candidate
+                        best_match_end_index = end_idx
+                        best_confidence = 1.0
+                        break  # Stop on first (longest) match
+                except:
+                    pass
+
+            normalized_partial = self.normalize_pcode_portion(partial_text)
+            normalized_clean = normalized_partial.replace(' ', '')
+
+            # Extract letter-digit sequence - take the first one
+            match = re.match(r'^([a-z]+\d+)', normalized_clean)
+
+            if match:
+                candidate = match.group(1)
+
+                # Debug: print what we're checking
+                print(f"  DEBUG: Checking candidate '{candidate}' from words: {words[:end_idx]}")
+
+                # Check if this EXACT candidate is in our list
+                if candidate in [str(p).lower() for p in self.pcode_list]:
+                    print(f"  DEBUG: Found exact match '{candidate}'!")
+                    best_match = candidate
+                    best_match_end_index = end_idx
+                    best_confidence = 1.0
+                    break  # Stop on first (longest) match
+        
+        # If exact match found, return it
+        if best_match:
+            remaining_text = ' '.join(words[best_match_end_index:])
+            return best_match, remaining_text, best_confidence
+        
+        # No exact match - try fuzzy matching
+        for end_idx in range(1, min(len(words) + 1, 10)):
+            partial_text = ' '.join(words[:end_idx])
+            normalized_partial = self.normalize_pcode_portion(partial_text)
+            normalized_clean = normalized_partial.replace(' ', '')
+            match = re.match(r'^([a-z]+\d+)', normalized_clean)
+            
+            if match:
+                candidate = match.group(1)
+                closest_match, score = self.find_closest_pcode(candidate, threshold=0.75)
+                if closest_match and score > best_confidence:
+                    best_match = closest_match
+                    best_match_end_index = end_idx
+                    best_confidence = score
+        
+        if best_match:
+            remaining_text = ' '.join(words[best_match_end_index:])
+            return best_match, remaining_text, best_confidence
+        
+        return "", text_lower, 0.0
+    
+    def parse_quantity(self, text: str) -> str:
+        """
+        Parse quantity from text. Handles both:
+        1. Digit-by-digit speech: "three two one" -> "321"
+        2. Indian style: "three seventy two" -> "372" (not 75!)
+        3. Natural numbers: "three hundred twenty one" -> "321"
+        """
+        text = text.lower().strip()
+        
+        if not text:
+            return ""
+        
+        # Remove ALL punctuation first
+        text = re.sub(r'[.,!?;:]', '', text)
+        
+        # Remove common words like "pieces", "units", etc.
+        text = re.sub(r'\b(pieces|piece|units|unit|items|item|species|p\s*c|pc)\b', '', text, flags=re.IGNORECASE)
+        text = text.strip()
+        
+        if not text:
+            return ""
+        
+        # Split into words and filter out empty strings
+        words = [w for w in text.split() if w]
+        
+        if not words:
+            return ""
+        
+        # Define word categories
+        single_digit_words = {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'}
+        multiplier_words = {'hundred', 'thousand', 'lakh', 'lakhs', 'lac', 'lacs', 'crore', 'crores', 
+                           'million', 'millions', 'billion', 'billions', 'trillion', 'trillions', 'and'}
+        compound_words = {'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 
+                         'seventeen', 'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty', 
+                         'sixty', 'seventy', 'eighty', 'ninety'}
+        
+        # Check if we have multipliers (hundred, thousand, etc.) - indicates natural number
+        has_multiplier = any(word in multiplier_words for word in words)
+        
+        # If there are multipliers, use natural number parsing
+        if has_multiplier:
+            try:
+                qty_num = self.words_to_number(' '.join(words))
+                print(f"  DEBUG QTY: Natural number mode (has multipliers): {words} -> {qty_num}")
+                return str(qty_num)
+            except Exception as e:
+                print(f"  DEBUG QTY: Failed natural number parsing: {words}: {e}")
+                return ""
+        
+        # No multipliers - could be digit-by-digit OR Indian-style compound
+        # Check if ALL words are single digits
+        all_single_digits = all(word in single_digit_words for word in words)
+        
+        if all_single_digits:
+            # Pure digit-by-digit: "three two one" -> "321"
+            digit_map = {
+                'zero': '0', 'oh': '0', 'one': '1', 'two': '2', 'three': '3', 
+                'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9'
+            }
+            result = ''.join(digit_map.get(word, '') for word in words)
+            print(f"  DEBUG QTY: Digit-by-digit mode: {words} -> '{result}'")
+            return result if result else ""
+        
+        # Has compound words but no multipliers - ALWAYS use natural number arithmetic
+        # "seventy two" -> 72 (70 + 2)
+        # "one thirty five" -> 135 (1 + 30 + 5)  
+        # "two sixty seven" -> 267 (2 + 60 + 7)
+        # This is standard English number speaking, not concatenation!
+        
+        try:
+            qty_num = self.words_to_number(' '.join(words))
+            print(f"  DEBUG QTY: Natural number with compounds: {words} -> {qty_num}")
+            return str(qty_num)
+        except Exception as e:
+            print(f"  DEBUG QTY: Failed compound parsing: {words}: {e}")
+            return ""
+    
+    def extract_pcode_and_qty(self, transcript: str) -> Tuple[str, str, float]:
+        """
+        Extract both pcode and quantity from transcript.
+        First finds the exact pcode, then parses remaining text as quantity.
+        Returns: (pcode, quantity, confidence_score)
+        """
+        # Extract pcode and get remaining text
+        pcode, remaining_text, confidence = self.extract_pcode_and_remaining_text(transcript)
+        
+        if not pcode:
+            return "", "", 0.0
+        
+        # DON'T remove duplicate digits - they're part of the quantity!
+        # The quantity text is already correctly separated by extract_pcode_and_remaining_text
+        
+        # Parse remaining text as quantity
+        qty_str = self.parse_quantity(remaining_text)
+        
+        return pcode, qty_str, confidence
+    
+    def process_audio(self, audio_file_path: str) -> Dict:
+        """Complete pipeline: transcribe -> extract pcode -> separate quantity."""
+        print(f"Transcribing: {audio_file_path}")
+        transcription_response = self.transcribe_audio(audio_file_path)
+        
+        transcript = transcription_response["results"]["channels"][0]["alternatives"][0]["transcript"]
+        print(f"Transcribed text: {transcript}")
+        
+        pcode, qty, confidence = self.extract_pcode_and_qty(transcript)
+        
+        confidence_label = "EXACT" if confidence == 1.0 else f"FUZZY ({confidence:.0%})"
+        print(f"Extracted pcode: {pcode} [{confidence_label}], qty: {qty}")
+        
+        return {
+            "audio_file": audio_file_path,
+            "transcript": transcript,
+            "pcode": pcode,
+            "quantity": qty,
+            "confidence": confidence,
+            "full_response": transcription_response
+        }
+    
+    def batch_process(self, audio_files: List[str]) -> List[Dict]:
+        """Process multiple audio files."""
+        results = []
+        for audio_file in audio_files:
+            try:
+                result = self.process_audio(audio_file)
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing {audio_file}: {e}")
+                results.append({
+                    "audio_file": audio_file,
+                    "error": str(e)
+                })
+        
+        return results
+
+
 if __name__ == "__main__":
-    main("c4113.mp3", language_code="eng")
+    with open("keys/deepgram.key", "r") as f:
+        api_key = f.read().strip()
+    
+    transcriber = ProductCodeTranscriber(api_key)
+    
+    # Get all .mp3 files from audio folder
+    audio_folder = Path("audio")
+    if not audio_folder.exists():
+        print(f"Error: '{audio_folder}' folder not found!")
+        exit(1)
+    
+    audio_files = list(audio_folder.glob("*.mp3"))
+    
+    if not audio_files:
+        print(f"No .mp3 files found in '{audio_folder}' folder!")
+        exit(1)
+    
+    print(f"\nFound {len(audio_files)} .mp3 files to process\n")
+    print("=" * 80)
+    
+    # Batch process all files
+    results = transcriber.batch_process([str(f) for f in audio_files])
+    
+    # Print summary results
+    print("\n" + "=" * 80)
+    print("\n=== SUMMARY RESULTS ===\n")
+    
+    for r in results:
+        if 'error' in r:
+            print(f"❌ {r['audio_file']}: ERROR - {r['error']}")
+        else:
+            confidence = r.get('confidence', 0.0)
+            confidence_icon = "✓" if confidence == 1.0 else "⚠"
+            confidence_label = "EXACT" if confidence == 1.0 else f"FUZZY ({confidence:.0%})"
+            
+            print(f"{confidence_icon} {Path(r['audio_file']).name} [{confidence_label}]")
+            print(f"  Transcript: {r['transcript']}")
+            print(f"  Product Code: {r['pcode']}")
+            print(f"  Quantity: {r['quantity']}")
+            print()
