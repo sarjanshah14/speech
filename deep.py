@@ -155,44 +155,56 @@ class ProductCodeTranscriber:
     
     def normalize_pcode_portion(self, text: str) -> str:
         """Normalize only the product code portion (letters + individual digits)."""
-        text = text.lower().strip()
-        
+        original_text = text.lower().strip()
+        text = original_text
+
+        # Check if original text contains compound words
+        compound_words = {'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+                         'seventeen', 'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty',
+                         'sixty', 'seventy', 'eighty', 'ninety'}
+        has_compound = any(word in compound_words for word in original_text.split())
+
+        # Map letter words to letters to avoid confusion
+        letter_map = {
+            'zed': 'z', 'zee': 'z',
+            'bee': 'b',
+            'see': 'c', 'sea': 'c',
+            'dee': 'd',
+            'pee': 'p',
+            'tee': 't',
+            'vee': 'v',
+            'doubleyou': 'w', 'double u': 'w',
+            'ex': 'x',
+            'why': 'y',
+            'jay': 'j',
+            'kay': 'k',
+            'ell': 'l',
+            'em': 'm',
+            'en': 'n',
+            'oh': 'o',
+            'queue': 'q',
+            'are': 'r',
+            'ess': 's',
+            'you': 'u'
+        }
+
+        for word, letter in letter_map.items():
+            text = re.sub(r'\b' + word + r'\b', letter, text)
+
         # Remove "and" and commas from constructions like "one hundred and eight"
         text = re.sub(r'\band\b', '', text)
         text = re.sub(r',', ' ', text)
-        
-        # CRITICAL: Remove ALL multiplier words that might appear in product codes
-        # These should be ignored as they're typically misinterpretations
-        # e.g., "L one thousand two fifty seven" should become "L one two fifty seven"
-        # e.g., "H one lakh two" should become "H one two"
-        multiplier_words = r'\b(hundred|thousand|lakh|lakhs|lac|lacs|crore|crores|million|millions|billion|billions|trillion|trillions)\b'
-        text = re.sub(multiplier_words, '', text)
-        
-        # Handle special cases like "triple zero", "double five"
-        special_patterns = [
-            (r'\btriple\s+zero\b', '000'), (r'\btriple\s+one\b', '111'), (r'\btriple\s+two\b', '222'),
-            (r'\btriple\s+three\b', '333'), (r'\btriple\s+four\b', '444'), (r'\btriple\s+five\b', '555'),
-            (r'\btriple\s+six\b', '666'), (r'\btriple\s+seven\b', '777'), (r'\btriple\s+eight\b', '888'),
-            (r'\btriple\s+nine\b', '999'),
-            (r'\bdouble\s+zero\b', '00'), (r'\bdouble\s+one\b', '11'), (r'\bdouble\s+two\b', '22'),
-            (r'\bdouble\s+three\b', '33'), (r'\bdouble\s+four\b', '44'), (r'\bdouble\s+five\b', '55'),
-            (r'\bdouble\s+six\b', '66'), (r'\bdouble\s+seven\b', '77'), (r'\bdouble\s+eight\b', '88'),
-            (r'\bdouble\s+nine\b', '99'),
-        ]
-        
-        for pattern, replacement in special_patterns:
-            text = re.sub(pattern, replacement, text)
-        
-        # Handle "one hundred eight" style patterns in product codes
+
+        # Handle "one hundred eight" style patterns in product codes BEFORE removing multipliers
         # These should become "108" not "18"
         # Match patterns like "X hundred Y" or "X hundred YZ"
         for hundreds_digit in range(1, 10):
             hundreds_word = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'][hundreds_digit - 1]
-            
+
             # Match "X hundred YZ" patterns and convert to full three digits
             for tens_digit in range(0, 10):
                 tens_word = ['', 'ten', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'][tens_digit]
-                
+
                 if tens_digit == 0:
                     # Just ones digit (e.g., "one hundred eight" -> "108")
                     for ones_digit in range(0, 10):
@@ -210,32 +222,65 @@ class ProductCodeTranscriber:
                 else:
                     # Tens + ones (e.g., "one hundred twenty three" -> "123")
                     for ones_digit in range(0, 10):
-                        ones_word = ['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'][ones_digit]
+                        ones_word = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'][ones_digit]
                         if ones_word:
                             pattern = rf'\b{hundreds_word}\s+hundred\s+{tens_word}\s+{ones_word}\b'
                             replacement = f'{hundreds_digit}{tens_digit}{ones_digit}'
                             text = re.sub(pattern, replacement, text)
-                        else:
-                            # Just tens (e.g., "one hundred twenty" -> "120")
-                            pattern = rf'\b{hundreds_word}\s+hundred\s+{tens_word}\b'
-                            replacement = f'{hundreds_digit}{tens_digit}0'
-                            text = re.sub(pattern, replacement, text)
-            
+
+                    # Just tens (e.g., "one hundred twenty" -> "120")
+                    pattern = rf'\b{hundreds_word}\s+hundred\s+{tens_word}\b'
+                    replacement = f'{hundreds_digit}{tens_digit}0'
+                    text = re.sub(pattern, replacement, text)
+
             # Handle "X hundred" alone -> "X00"
             pattern = rf'\b{hundreds_word}\s+hundred\b'
             replacement = f'{hundreds_digit}00'
             text = re.sub(pattern, replacement, text)
-        
+
+        # CRITICAL: Remove ALL multiplier words that might appear in product codes
+        # These should be ignored as they're typically misinterpretations
+        # e.g., "L one thousand two fifty seven" should become "L one two fifty seven"
+        # e.g., "H one lakh two" should become "H one two"
+        multiplier_words = r'\b(hundred|thousand|lakh|lakhs|lac|lacs|crore|crores|million|millions|billion|billions|trillion|trillions)\b'
+        text = re.sub(multiplier_words, ' ', text)
+
+        # Handle special cases like "triple zero", "double five"
+        special_patterns = [
+            (r'\btriple\s+zero\b', '000'), (r'\btriple\s+one\b', '111'), (r'\btriple\s+two\b', '222'),
+            (r'\btriple\s+three\b', '333'), (r'\btriple\s+four\b', '444'), (r'\btriple\s+five\b', '555'),
+            (r'\btriple\s+six\b', '666'), (r'\btriple\s+seven\b', '777'), (r'\btriple\s+eight\b', '888'),
+            (r'\btriple\s+nine\b', '999'),
+            (r'\bdouble\s+zero\b', '00'), (r'\bdouble\s+one\b', '11'), (r'\bdouble\s+two\b', '22'),
+            (r'\bdouble\s+three\b', '33'), (r'\bdouble\s+four\b', '44'), (r'\bdouble\s+five\b', '55'),
+            (r'\bdouble\s+six\b', '66'), (r'\bdouble\s+seven\b', '77'), (r'\bdouble\s+eight\b', '88'),
+            (r'\bdouble\s+nine\b', '99'),
+        ]
+
+        for pattern, replacement in special_patterns:
+            text = re.sub(pattern, replacement, text)
+
         # DON'T convert compound numbers in product codes!
         # Product codes are spelled digit-by-digit, not as compound numbers
         # e.g., "L one two five seven" not "L one thousand two hundred fifty seven"
         # Skip the hundred/thousand conversion entirely for product codes
-        
+
         # Handle misrecognized tens + ones as separate digits in product codes
         # e.g., "fifty seven" likely means "five seven" (5 7) not fifty-seven (57)
         # "twenty three" likely means "two three" (2 3) not twenty-three (23)
         tens_corrections = [
+            # Teens (compound words)
             (r'\bten\b', '1 0'),
+            (r'\beleven\b', '1 1'),
+            (r'\btwelve\b', '1 2'),
+            (r'\bthirteen\b', '1 3'),
+            (r'\bfourteen\b', '1 4'),
+            (r'\bfifteen\b', '1 5'),
+            (r'\bsixteen\b', '1 6'),
+            (r'\bseventeen\b', '1 7'),
+            (r'\beighteen\b', '1 8'),
+            (r'\bnineteen\b', '1 9'),
+            # Tens + ones
             (r'\btwenty\s+(one|two|three|four|five|six|seven|eight|nine)\b', r'2 \1'),
             (r'\bthirty\s+(one|two|three|four|five|six|seven|eight|nine)\b', r'3 \1'),
             (r'\bforty\s+(one|two|three|four|five|six|seven|eight|nine)\b', r'4 \1'),
@@ -254,10 +299,10 @@ class ProductCodeTranscriber:
             (r'\beighty\b', '8 0'),
             (r'\bninety\b', '9 0'),
         ]
-        
+
         for pattern, replacement in tens_corrections:
             text = re.sub(pattern, replacement, text)
-        
+
         # Only convert individual digit words (0-9)
         simple_digit_map = {
             'zero': '0', 'oh': '0',
@@ -266,10 +311,17 @@ class ProductCodeTranscriber:
             'five': '5', 'six': '6', 'seven': '7',
             'eight': '8', 'ate': '8', 'nine': '9'
         }
-        
+
         for word, digit in simple_digit_map.items():
             text = re.sub(r'\b' + word + r'\b', digit, text)
-        
+
+        # Clean up spaces: concatenate letters with digits
+        text = re.sub(r'([a-z])\s+(\d)', r'\1\2', text)
+        # Conditionally concatenate digits with digits only if no compound words in original
+        if not has_compound:
+            text = re.sub(r'\d(\s+\d)+', lambda m: m.group(0).replace(' ', ''), text)
+
+        text = text.strip()
         return text
     
     def find_closest_pcode(self, candidate: str, threshold: float = 0.8) -> Tuple[str, float]:
@@ -368,17 +420,16 @@ class ProductCodeTranscriber:
         for end_idx in range(1, min(len(words) + 1, 15)):
             partial_text = ' '.join(words[:end_idx])
             normalized_partial = self.normalize_pcode_portion(partial_text)
-            
-            # Extract letter-digit sequence
-            normalized_clean = normalized_partial.replace(' ', '')
-            match = re.match(r'^([a-z]+\d+)', normalized_clean)
-            
+
+            # Extract letter-digit sequence - take the first one
+            match = re.search(r'([a-z]+\d+)', normalized_partial)
+
             if match:
                 candidate = match.group(1)
-                
+
                 # Debug: print what we're checking
                 print(f"  DEBUG: Checking candidate '{candidate}' from words: {words[:end_idx]}")
-                
+
                 # Check if this EXACT candidate is in our list
                 if candidate in [str(p).lower() for p in self.pcode_list]:
                     print(f"  DEBUG: Found exact match '{candidate}'!")
