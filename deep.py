@@ -1,6 +1,7 @@
 import requests
 import json
 import re
+import os
 from typing import Dict, List, Tuple
 from pathlib import Path
 import openpyxl
@@ -13,30 +14,38 @@ class ProductCodeTranscriber:
         """
         self.api_key = deepgram_api_key
         self.base_url = "https://api.deepgram.com/v1/listen"
-        
+
         if pcode_list is None:
             self.pcode_list = self.load_pcodes_from_excel(excel_file)
         else:
             self.pcode_list = pcode_list
-        
+
         print(f"Loaded {len(self.pcode_list)} product codes")
-        
+
         self.headers = {
             "Authorization": f"Token {deepgram_api_key}"
         }
+
+        # Deepgram v3 client for live transcription
+        from deepgram.client import DeepgramClient
+        self.dg_client = DeepgramClient(api_key=deepgram_api_key)
     
     def load_pcodes_from_excel(self, excel_file: str) -> List[str]:
         """Load product codes from Excel file first column."""
         try:
+            # If excel_file is relative, make it absolute relative to this script's directory
+            if not os.path.isabs(excel_file):
+                excel_file = os.path.join(os.path.dirname(__file__), excel_file)
+
             wb = openpyxl.load_workbook(excel_file)
             ws = wb.active
-            
+
             pcodes = []
             for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
                 if row[0]:
                     code = str(row[0]).strip()
                     pcodes.append(code)
-            
+
             wb.close()
             return pcodes
         except Exception as e:
@@ -365,6 +374,7 @@ class ProductCodeTranscriber:
     def extract_pcode_and_remaining_text(self, text: str) -> Tuple[str, str, float]:
         """
         Extract pcode and return the remaining text after the pcode.
+        Handles all patterns: pure numbers, letter+numbers, mixed, pure letters.
         Returns: (pcode, remaining_text, confidence_score)
         """
         text_lower = text.lower().strip()
@@ -373,87 +383,85 @@ class ProductCodeTranscriber:
         if not words:
             return "", "", 0.0
         
-        # Check if first word is misrecognized "eight" -> "h"
-        first_word = words[0]
-        if first_word == 'eight' and len(words) > 1:
-            next_word = words[1]
-            digit_words = {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
-                          'double', 'triple'}
-            if next_word in digit_words or next_word.startswith('doub') or next_word.startswith('trip'):
-                text_lower = 'h ' + ' '.join(words[1:])
-                words = text_lower.split()
+        # Normalize the text for parsing
+        normalized_text = self.normalize_pcode_portion(text_lower)
+        normalized_clean = normalized_text.replace(' ', '')
         
-        # Check if transcript is missing the first letter - try all single letters
-        first_word_is_digit = words[0] in {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 
-                                            'six', 'seven', 'eight', 'nine', 'double', 'triple'} or \
-                              words[0].startswith('doub') or words[0].startswith('trip') or \
-                              words[0].isdigit()
+        # Try different patterns in order of specificity
         
-        if first_word_is_digit:
-            # Try prefixing with each letter a-z
-            for letter in 'abcdefghijklmnopqrstuvwxyz':
-                test_text = letter + ' ' + text_lower
-                test_words = test_text.split()
-                
-                # Try to match with this letter prefix
-                for end_idx in range(1, min(len(test_words) + 1, 10)):
-                    partial_text = ' '.join(test_words[:end_idx])
-                    normalized_partial = self.normalize_pcode_portion(partial_text)
-                    normalized_clean = normalized_partial.replace(' ', '')
-                    match = re.match(r'^([a-z]+\d+)', normalized_clean)
-                    
-                    if match:
-                        candidate = match.group(1)
-                        for pcode in self.pcode_list:
-                            pcode_clean = str(pcode).lower()
-                            if pcode_clean == candidate:
-                                # Found a match! Return it
-                                remaining_text = ' '.join(words[end_idx-1:])
-                                return pcode_clean, remaining_text, 1.0
+        # 1. Pure numbers (e.g., "10006", "11001")
+        if normalized_clean.isdigit():
+            if normalized_clean in [str(p) for p in self.pcode_list]:
+                return normalized_clean, "", 1.0
         
-        # Find where the pcode ends by matching against known pcodes
-        # Try progressively longer sequences and check each one
+        # 2. Letter + numbers (e.g., "A0002", "E0002") 
+        letter_number_match = re.match(r'^([a-z]+\d+)$', normalized_clean)
+        if letter_number_match:
+            candidate = letter_number_match.group(1)
+            if candidate in [str(p).lower() for p in self.pcode_list]:
+                return candidate, "", 1.0
+        
+        # 3. Mixed patterns (e.g., "13ED0001", "BLP001", "C21DH101")
+        mixed_match = re.match(r'^([a-z0-9]+)$', normalized_clean)
+        if mixed_match:
+            candidate = mixed_match.group(1)
+            if candidate in [str(p).lower() for p in self.pcode_list]:
+                return candidate, "", 1.0
+        
+        # 4. Pure letters (e.g., "INBACALK", "INBACANU")
+        if normalized_clean.isalpha():
+            if normalized_clean in [str(p).lower() for p in self.pcode_list]:
+                return normalized_clean, "", 1.0
+        
+        # 5. Progressive matching for partial input
+        # Try different word combinations to find the longest valid match
         best_match = ""
         best_match_end_index = 0
         best_confidence = 0.0
         
-        for end_idx in range(1, min(len(words) + 1, 15)):
+        # Try from 1 word to full length
+        for end_idx in range(1, min(len(words) + 1, 12)):
             partial_text = ' '.join(words[:end_idx])
-            normalized_partial = self.normalize_pcode_portion(partial_text)
-
-            # Extract letter-digit sequence - take the first one
-            match = re.search(r'([a-z]+\d+)', normalized_partial)
-
-            if match:
-                candidate = match.group(1)
-
-                # Debug: print what we're checking
-                print(f"  DEBUG: Checking candidate '{candidate}' from words: {words[:end_idx]}")
-
-                # Check if this EXACT candidate is in our list
-                if candidate in [str(p).lower() for p in self.pcode_list]:
-                    print(f"  DEBUG: Found exact match '{candidate}'!")
-                    best_match = candidate
+            partial_normalized = self.normalize_pcode_portion(partial_text)
+            partial_clean = partial_normalized.replace(' ', '')
+            
+            # Check if this partial matches any known code
+            if partial_clean in [str(p).lower() for p in self.pcode_list]:
+                print(f"  DEBUG: Found exact match '{partial_clean}' from words: {words[:end_idx]}")
+                best_match = partial_clean
+                best_match_end_index = end_idx
+                best_confidence = 1.0
+                # Don't break - keep looking for longer matches
+        
+        # Special case: if we have a pure number code, try to separate it from quantity
+        if not best_match and len(words) >= 2:
+            # Check if first word(s) form a valid product code
+            for end_idx in range(1, min(len(words) + 1, 6)):  # Max 5 digits for product codes
+                partial_text = ' '.join(words[:end_idx])
+                partial_normalized = self.normalize_pcode_portion(partial_text)
+                partial_clean = partial_normalized.replace(' ', '')
+                
+                if partial_clean.isdigit() and partial_clean in [str(p) for p in self.pcode_list]:
+                    print(f"  DEBUG: Found pure number match '{partial_clean}' from words: {words[:end_idx]}")
+                    best_match = partial_clean
                     best_match_end_index = end_idx
                     best_confidence = 1.0
-                    # STOP HERE - don't look for longer matches
                     break
         
-        # If exact match found, return it
+        # If we found an exact match, return it
         if best_match:
             remaining_text = ' '.join(words[best_match_end_index:])
             return best_match, remaining_text, best_confidence
         
-        # No exact match - try fuzzy matching
-        for end_idx in range(1, min(len(words) + 1, 10)):
+        # 6. Fuzzy matching for close matches
+        for end_idx in range(2, min(len(words) + 1, 10)):
             partial_text = ' '.join(words[:end_idx])
-            normalized_partial = self.normalize_pcode_portion(partial_text)
-            normalized_clean = normalized_partial.replace(' ', '')
-            match = re.match(r'^([a-z]+\d+)', normalized_clean)
+            partial_normalized = self.normalize_pcode_portion(partial_text)
+            partial_clean = partial_normalized.replace(' ', '')
             
-            if match:
-                candidate = match.group(1)
-                closest_match, score = self.find_closest_pcode(candidate, threshold=0.75)
+            # Only try fuzzy matching for reasonable candidates
+            if len(partial_clean) >= 3:
+                closest_match, score = self.find_closest_pcode(partial_clean, threshold=0.8)
                 if closest_match and score > best_confidence:
                     best_match = closest_match
                     best_match_end_index = end_idx
@@ -480,8 +488,16 @@ class ProductCodeTranscriber:
         # Remove ALL punctuation first
         text = re.sub(r'[.,!?;:]', '', text)
         
-        # Remove common words like "pieces", "units", etc.
-        text = re.sub(r'\b(pieces|piece|units|unit|items|item|species|p\s*c|pc)\b', '', text, flags=re.IGNORECASE)
+        # Remove common unit words (any unit, not just pieces)
+        unit_words = [
+            'pieces', 'piece', 'units', 'unit', 'items', 'item', 'species', r'p\s*c', 'pc',
+            'bundles', 'bundle', 'books', 'book', 'boxes', 'box', 'packets', 'packet',
+            'packs', 'pack', 'sets', 'set', 'pairs', 'pair', 'dozens', 'dozen',
+            'kilos', 'kilo', 'grams', 'gram', 'liters', 'liter', 'meters', 'meter',
+            'bags', 'bag', 'bottles', 'bottle', 'cans', 'can', 'tubes', 'tube'
+        ]
+        unit_pattern = r'\b(' + '|'.join(unit_words) + r')\b'
+        text = re.sub(unit_pattern, '', text, flags=re.IGNORECASE)
         text = text.strip()
         
         if not text:
@@ -528,12 +544,51 @@ class ProductCodeTranscriber:
             print(f"  DEBUG QTY: Digit-by-digit mode: {words} -> '{result}'")
             return result if result else ""
         
-        # Has compound words but no multipliers - ALWAYS use natural number arithmetic
-        # "seventy two" -> 72 (70 + 2)
-        # "one thirty five" -> 135 (1 + 30 + 5)  
-        # "two sixty seven" -> 267 (2 + 60 + 7)
-        # This is standard English number speaking, not concatenation!
+        # Check if all words are simple numbers (0-9) - digit-by-digit mode
+        simple_digit_words = {'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'}
+        if all(word in simple_digit_words for word in words):
+            digit_map = {
+                'zero': '0', 'oh': '0', 'one': '1', 'two': '2', 'three': '3', 
+                'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9'
+            }
+            result = ''.join(digit_map.get(word, '') for word in words)
+            print(f"  DEBUG QTY: Digit-by-digit mode: {words} -> '{result}'")
+            return result if result else ""
         
+        # Check if all words are already digits (like "45", "16", "13")
+        if all(word.isdigit() for word in words):
+            # For quantity, we want to join digits: "4 2" -> "42", not "4 2 35" -> "4235"
+            # Only join if it makes sense (2-3 digits max for quantity)
+            if len(words) <= 3:
+                result = ''.join(words)
+                print(f"  DEBUG QTY: Pure digits mode: {words} -> '{result}'")
+                return result
+            else:
+                # Too many digits, might be product code mixed with quantity
+                # Take only the last 2-3 digits as quantity
+                if len(words) >= 3:
+                    result = ''.join(words[-2:])  # Take last 2 digits
+                    print(f"  DEBUG QTY: Last digits mode: {words} -> '{result}'")
+                    return result
+        
+        # Try simple two-digit parsing for compound numbers
+        if len(words) == 2:
+            try:
+                tens_words = {'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'}
+                ones_words = {'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'}
+                
+                if words[0] in tens_words and words[1] in ones_words:
+                    tens_map = {'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50, 
+                               'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90}
+                    ones_map = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+                               'six': 6, 'seven': 7, 'eight': 8, 'nine': 9}
+                    result = tens_map[words[0]] + ones_map[words[1]]
+                    print(f"  DEBUG QTY: Two-digit mode: {words} -> {result}")
+                    return str(result)
+            except Exception:
+                pass
+        
+        # Fallback to natural number arithmetic for complex cases
         try:
             qty_num = self.words_to_number(' '.join(words))
             print(f"  DEBUG QTY: Natural number with compounds: {words} -> {qty_num}")
