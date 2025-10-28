@@ -251,7 +251,8 @@ class ProductCodeTranscriber:
         # These should be ignored as they're typically misinterpretations
         # e.g., "L one thousand two fifty seven" should become "L one two fifty seven"
         # e.g., "H one lakh two" should become "H one two"
-        multiplier_words = r'\b(hundred|thousand|lakh|lakhs|lac|lacs|crore|crores|million|millions|billion|billions|trillion|trillions)\b'
+        # Note: 'hundred' is excluded because it can be part of product codes like "one hundred one" = "101"
+        multiplier_words = r'\b(thousand|lakh|lakhs|lac|lacs|crore|crores|million|millions|billion|billions|trillion|trillions)\b'
         text = re.sub(multiplier_words, ' ', text)
 
         # Handle special cases like "triple zero", "double five"
@@ -268,6 +269,9 @@ class ProductCodeTranscriber:
 
         for pattern, replacement in special_patterns:
             text = re.sub(pattern, replacement, text)
+
+        # Handle "hundred" as "100" in product codes
+        text = re.sub(r'\bhundred\b', '100', text)
 
         # DON'T convert compound numbers in product codes!
         # Product codes are spelled digit-by-digit, not as compound numbers
@@ -357,9 +361,11 @@ class ProductCodeTranscriber:
             
             # Also check if candidate is a substring or vice versa
             if candidate_lower in pcode_clean or pcode_clean in candidate_lower:
-                # Boost score for substring matches
-                substring_score = max(len(candidate_lower), len(pcode_clean)) / max(len(candidate_lower), len(pcode_clean))
-                similarity = max(similarity, substring_score * 0.9)
+                # Only boost substring matches for reasonably long candidates to prevent over-matching
+                if len(candidate_lower) >= 4:
+                    # Boost score for substring matches (minimally to prevent over-matching)
+                    substring_score = max(len(candidate_lower), len(pcode_clean)) / max(len(candidate_lower), len(pcode_clean))
+                    similarity = max(similarity, substring_score * 0.2)
             
             if similarity > best_score:
                 best_score = similarity
@@ -378,6 +384,8 @@ class ProductCodeTranscriber:
         Returns: (pcode, remaining_text, confidence_score)
         """
         text_lower = text.lower().strip()
+        # Remove punctuation that might split product codes
+        text_lower = re.sub(r'[.,!?;:]', '', text_lower)
         words = text_lower.split()
         
         if not words:
@@ -418,20 +426,21 @@ class ProductCodeTranscriber:
         best_match = ""
         best_match_end_index = 0
         best_confidence = 0.0
-        
-        # Try from 1 word to full length
-        for end_idx in range(1, min(len(words) + 1, 12)):
+
+        # Try from longest to shortest to prefer longer matches
+        max_end = min(len(words), 12)
+        for end_idx in range(max_end, 0, -1):
             partial_text = ' '.join(words[:end_idx])
             partial_normalized = self.normalize_pcode_portion(partial_text)
             partial_clean = partial_normalized.replace(' ', '')
-            
+
             # Check if this partial matches any known code
-            if partial_clean in [str(p).lower() for p in self.pcode_list]:
+            if len(partial_clean) >= 4 and partial_clean in [str(p).lower() for p in self.pcode_list]:
                 print(f"  DEBUG: Found exact match '{partial_clean}' from words: {words[:end_idx]}")
                 best_match = partial_clean
                 best_match_end_index = end_idx
                 best_confidence = 1.0
-                # Don't break - keep looking for longer matches
+                break  # Stop at the first (longest) match
         
         # Special case: if we have a pure number code, try to separate it from quantity
         if not best_match and len(words) >= 2:
@@ -440,8 +449,8 @@ class ProductCodeTranscriber:
                 partial_text = ' '.join(words[:end_idx])
                 partial_normalized = self.normalize_pcode_portion(partial_text)
                 partial_clean = partial_normalized.replace(' ', '')
-                
-                if partial_clean.isdigit() and partial_clean in [str(p) for p in self.pcode_list]:
+
+                if len(partial_clean) >= 3 and partial_clean.isdigit() and partial_clean in [str(p) for p in self.pcode_list]:
                     print(f"  DEBUG: Found pure number match '{partial_clean}' from words: {words[:end_idx]}")
                     best_match = partial_clean
                     best_match_end_index = end_idx
@@ -460,7 +469,7 @@ class ProductCodeTranscriber:
             partial_clean = partial_normalized.replace(' ', '')
             
             # Only try fuzzy matching for reasonable candidates
-            if len(partial_clean) >= 3:
+            if len(partial_clean) >= 2:
                 closest_match, score = self.find_closest_pcode(partial_clean, threshold=0.8)
                 if closest_match and score > best_confidence:
                     best_match = closest_match
